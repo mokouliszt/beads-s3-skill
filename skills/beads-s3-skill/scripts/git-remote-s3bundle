@@ -1,0 +1,457 @@
+#!/usr/bin/env python3
+"""git remote helper: keep a whole repository as one git bundle object
+in an S3-compatible bucket.
+
+git runs this as `git-remote-s3bundle <remote> s3bundle://<bucket>/<key>`.
+The bundle is unpacked into a local bare mirror, git talks to that mirror,
+and a push uploads a fresh bundle of the mirror. Uploads are
+conditional on the object not having changed since it was read, so a
+concurrent push from somewhere else is reported back to git as
+"fetch first" instead of being overwritten.
+
+Extra modes used by setup.sh:
+  git-remote-s3bundle --stat <url>   exit 0 if the object exists, 3 if not
+  git-remote-s3bundle --seed <url>   create the object with an empty
+                                     commit on refs/heads/main if missing
+
+Settings are read from $BEADS_S3_CONFIG, or ~/.config/beads-s3/config.json:
+  endpoint_url, region, access_key_id, secret_access_key,
+  addressing_style ("path" or "virtual", default "path"),
+  conditional_writes ("auto", "always" or "never", default "auto").
+Keys that are missing fall back to boto3's usual sources (AWS_* env vars,
+~/.aws/credentials, ...).
+"""
+
+import fcntl
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+
+ZERO = "0" * 40
+# A bucket read is reused for this long by later git calls (bd runs several
+# per push). Writes stay conditional, so a stale read can only make a push
+# fail with "fetch first"; it cannot overwrite anything.
+READ_REUSE_SECONDS = 15
+REPO_ENV = (
+    "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_COMMON_DIR", "GIT_NAMESPACE",
+    "GIT_QUARANTINE_PATH", "GIT_PREFIX",
+)
+UNSUPPORTED_CODES = {
+    "NotImplemented", "InvalidArgument", "InvalidRequest", "BadRequest",
+    "InvalidHeader", "UnsupportedHeader",
+}
+
+
+def log(msg):
+    sys.stderr.write("s3bundle: %s\n" % msg)
+    sys.stderr.flush()
+
+
+def die(msg, code=1):
+    log(msg)
+    sys.exit(code)
+
+
+def load_config():
+    path = os.environ.get("BEADS_S3_CONFIG") or os.path.join(
+        os.path.expanduser("~"), ".config", "beads-s3", "config.json")
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+def parse_url(url):
+    prefix = "s3bundle://"
+    if not url.startswith(prefix):
+        die("unsupported URL %r (expected s3bundle://<bucket>/<key>)" % url)
+    rest = url[len(prefix):]
+    bucket, _, key = rest.partition("/")
+    if not bucket or not key:
+        die("URL %r must name both a bucket and an object key" % url)
+    return bucket, key
+
+
+def make_client(cfg):
+    try:
+        import boto3
+        from botocore.config import Config
+    except ImportError:
+        die("boto3 is required (pip install boto3)")
+    kwargs = {}
+    if cfg.get("endpoint_url"):
+        kwargs["endpoint_url"] = cfg["endpoint_url"]
+    if cfg.get("region"):
+        kwargs["region_name"] = cfg["region"]
+    if cfg.get("access_key_id"):
+        kwargs["aws_access_key_id"] = cfg["access_key_id"]
+        kwargs["aws_secret_access_key"] = cfg.get("secret_access_key", "")
+    base = {
+        "s3": {"addressing_style": cfg.get("addressing_style", "path")},
+        "retries": {"max_attempts": 5, "mode": "standard"},
+    }
+    try:
+        # Many S3-compatible services reject the CRC checksums newer
+        # botocore sends by default; only send them when an API needs them.
+        conf = Config(request_checksum_calculation="when_required",
+                      response_checksum_validation="when_required", **base)
+    except TypeError:
+        conf = Config(**base)
+    return boto3.client("s3", config=conf, **kwargs)
+
+
+def error_info(exc):
+    resp = getattr(exc, "response", None) or {}
+    code = str(resp.get("Error", {}).get("Code", ""))
+    status = resp.get("ResponseMetadata", {}).get("HTTPStatusCode", 0)
+    return code, status
+
+
+def run(args, env=None, input_bytes=None, check=True):
+    proc = subprocess.run(args, env=env, input=input_bytes,
+                          stdin=None if input_bytes is not None else subprocess.DEVNULL,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if check and proc.returncode != 0:
+        die("command failed: %s\n%s" % (" ".join(args),
+                                        proc.stderr.decode(errors="replace").strip()))
+    return proc
+
+
+class Remote:
+    def __init__(self, url, cfg):
+        self.url = url
+        self.cfg = cfg
+        self.bucket, self.key = parse_url(url)
+        self._s3 = None
+        ident = "%s|%s|%s" % (cfg.get("endpoint_url", ""), self.bucket, self.key)
+        cache_root = os.environ.get("XDG_CACHE_HOME") or os.path.join(
+            os.path.expanduser("~"), ".cache")
+        base = os.path.join(cache_root, "beads-s3")
+        os.makedirs(base, exist_ok=True)
+        name = hashlib.sha256(ident.encode()).hexdigest()[:16]
+        self.cache = os.path.join(base, name + ".git")
+        self.state_path = os.path.join(base, name + ".json")
+        self._lock = open(os.path.join(base, name + ".lock"), "w")
+        fcntl.flock(self._lock, fcntl.LOCK_EX)
+        self.cache_env = {k: v for k, v in os.environ.items() if k not in REPO_ENV}
+        if not os.path.isdir(self.cache):
+            run(["git", "init", "--bare", "--quiet", self.cache], env=self.cache_env)
+            self.cgit("symbolic-ref", "HEAD", "refs/heads/main")
+            self.cgit("config", "gc.auto", "0")
+        self.etag = None
+        self.exists = False
+        self.refreshed = False
+        self.cas = {}
+        self.no_conditional = bool(self.load_state().get("no_conditional"))
+
+    @property
+    def s3(self):
+        if self._s3 is None:
+            self._s3 = make_client(self.cfg)
+        return self._s3
+
+    # --- local mirror -----------------------------------------------------
+
+    def cgit(self, *args, input_bytes=None, check=True):
+        return run(["git", "--git-dir", self.cache] + list(args),
+                   env=self.cache_env, input_bytes=input_bytes, check=check)
+
+    def refs(self):
+        out = self.cgit("for-each-ref", "--format=%(objectname) %(refname)").stdout
+        result = {}
+        for line in out.decode().splitlines():
+            sha, _, name = line.partition(" ")
+            if name:
+                result[name] = sha
+        return result
+
+    def clear_refs(self):
+        cmds = "".join("delete %s\n" % name for name in self.refs())
+        if cmds:
+            self.cgit("update-ref", "--stdin", input_bytes=cmds.encode())
+
+    def set_refs(self, wanted, current):
+        cmds = []
+        for name in set(wanted) | set(current):
+            old = current.get(name)
+            new = wanted.get(name)
+            if old == new:
+                continue
+            if new is None:
+                cmds.append("delete %s\n" % name)
+            else:
+                cmds.append("update %s %s\n" % (name, new))
+        if cmds:
+            self.cgit("update-ref", "--stdin", input_bytes="".join(cmds).encode())
+
+    def load_state(self):
+        try:
+            with open(self.state_path, encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return {}
+
+    def save_state(self, checked=True):
+        with open(self.state_path, "w", encoding="utf-8") as f:
+            json.dump({"etag": self.etag, "exists": self.exists,
+                       "checked_at": time.time() if checked else 0,
+                       "no_conditional": self.no_conditional}, f)
+
+    # --- bucket -----------------------------------------------------------
+
+    def refresh(self):
+        if self.refreshed:
+            return
+        state = self.load_state()
+        age = time.time() - state.get("checked_at", 0)
+        if "exists" in state and 0 <= age < READ_REUSE_SECONDS and \
+                bool(state["exists"]) == bool(self.refs()):
+            self.etag, self.exists = state.get("etag"), bool(state["exists"])
+            self.refreshed = True
+            return
+        from botocore.exceptions import ClientError
+        kwargs = {}
+        if state.get("exists") and state.get("etag") and self.refs():
+            kwargs["IfNoneMatch"] = state["etag"]
+        try:
+            resp = self.s3.get_object(Bucket=self.bucket, Key=self.key, **kwargs)
+        except ClientError as exc:
+            code, status = error_info(exc)
+            if status == 304 or code in ("304", "NotModified"):
+                self.etag, self.exists = state["etag"], True
+                self.save_state()
+                self.refreshed = True
+                return
+            if status == 404 or code in ("NoSuchKey", "404", "NotFound"):
+                self.clear_refs()
+                self.etag, self.exists = None, False
+                self.save_state()
+                self.refreshed = True
+                return
+            die("cannot read s3://%s/%s: %s" % (self.bucket, self.key, exc))
+        fd, tmp = tempfile.mkstemp(suffix=".bundle", dir=os.path.dirname(self.cache))
+        try:
+            with os.fdopen(fd, "wb") as f:
+                for chunk in iter(lambda: resp["Body"].read(1 << 20), b""):
+                    f.write(chunk)
+            self.cgit("-c", "gc.auto=0", "fetch", "--prune", "--no-tags", "--quiet",
+                      tmp, "+refs/*:refs/*")
+        finally:
+            os.unlink(tmp)
+        self.etag, self.exists = resp.get("ETag"), True
+        self.save_state()
+        self.refreshed = True
+
+    def head_etag(self):
+        from botocore.exceptions import ClientError
+        try:
+            return self.s3.head_object(Bucket=self.bucket, Key=self.key).get("ETag")
+        except ClientError as exc:
+            code, status = error_info(exc)
+            if status == 404 or code in ("NoSuchKey", "404", "NotFound"):
+                return None
+            raise
+
+    def upload(self):
+        """Upload a bundle of the mirror. Returns False if the object
+        changed in the bucket since refresh()."""
+        from botocore.exceptions import ClientError
+        fd, tmp = tempfile.mkstemp(suffix=".bundle", dir=os.path.dirname(self.cache))
+        os.close(fd)
+        try:
+            self.cgit("bundle", "create", "--quiet", tmp, "--all")
+            mode = self.cfg.get("conditional_writes", "auto")
+            if mode == "always" or (mode == "auto" and not self.no_conditional):
+                cond = {"IfMatch": self.etag} if self.exists else {"IfNoneMatch": "*"}
+                try:
+                    with open(tmp, "rb") as f:
+                        resp = self.s3.put_object(Bucket=self.bucket, Key=self.key,
+                                                  Body=f, **cond)
+                    return self._uploaded(resp)
+                except ClientError as exc:
+                    code, status = error_info(exc)
+                    if status in (409, 412) or code in ("PreconditionFailed",
+                                                        "ConditionalRequestConflict"):
+                        return False
+                    if mode == "always" or not (status == 501 or code in UNSUPPORTED_CODES):
+                        raise
+                    self.no_conditional = True
+            # The service does not take conditional headers: compare the
+            # current ETag right before writing instead.
+            current = self.head_etag()
+            if current != (self.etag if self.exists else None):
+                return False
+            with open(tmp, "rb") as f:
+                resp = self.s3.put_object(Bucket=self.bucket, Key=self.key, Body=f)
+            return self._uploaded(resp)
+        finally:
+            os.unlink(tmp)
+
+    def _uploaded(self, resp):
+        self.etag = resp.get("ETag") or self.head_etag()
+        self.exists = True
+        self.save_state()
+        return True
+
+    # --- helper protocol --------------------------------------------------
+
+    def list_refs(self):
+        self.refresh()
+        refs = self.refs()
+        lines = ["%s %s" % (sha, name) for name, sha in sorted(refs.items())]
+        if "refs/heads/main" in refs:
+            lines.append("@refs/heads/main HEAD")
+        return "".join(line + "\n" for line in lines) + "\n"
+
+    def fetch(self, batch):
+        self.refresh()
+        names = []
+        for line in batch:
+            parts = line.split(" ", 2)
+            if len(parts) == 3 and parts[2] not in names:
+                names.append(parts[2])
+        if names:
+            run(["git", "-c", "gc.auto=0", "-c", "maintenance.auto=false", "fetch",
+                 "--no-tags", "--no-write-fetch-head", "--quiet", self.cache] + names)
+        return "\n"
+
+    def push(self, batch):
+        self.refresh()
+        before = self.refs()
+        results = {}
+        specs = []
+        for line in batch:
+            spec = line[len("push "):]
+            force = spec.startswith("+")
+            if force:
+                spec = spec[1:]
+            src, _, dst = spec.partition(":")
+            expected = self.cas.get(dst)
+            if expected is not None and before.get(dst, ZERO) != expected:
+                results[dst] = "error %s stale info" % dst
+                continue
+            specs.append((force, src, dst))
+
+        changed = []
+        if specs:
+            args = ["git", "-c", "gc.auto=0", "push", "--porcelain", self.cache]
+            args += ["%s%s:%s" % ("+" if f else "", s, d) for f, s, d in specs]
+            proc = run(args, check=False)
+            for line in proc.stdout.decode(errors="replace").splitlines():
+                parts = line.split("\t")
+                if len(parts) < 3 or ":" not in parts[1]:
+                    continue
+                flag, dst = parts[0], parts[1].split(":", 1)[1]
+                if flag in (" ", "+", "-", "*"):
+                    changed.append(dst)
+                    results[dst] = "ok %s" % dst
+                elif flag == "=":
+                    results[dst] = "ok %s" % dst
+                else:
+                    reason = parts[2].strip()
+                    if "(" in reason and reason.endswith(")"):
+                        reason = reason[reason.index("(") + 1:-1]
+                    results[dst] = "error %s %s" % (dst, reason or "rejected")
+            for _, _, dst in specs:
+                if dst not in results:
+                    msg = proc.stderr.decode(errors="replace").strip().splitlines()
+                    results[dst] = "error %s %s" % (dst, msg[-1] if msg else "push failed")
+
+        if changed and not self.upload():
+            # Someone else pushed after we read the bucket: undo the
+            # mirror update, force the next call to read the bucket again,
+            # and let git report it as "fetch first".
+            self.set_refs(before, self.refs())
+            self.save_state(checked=False)
+            for dst in changed:
+                results[dst] = "error %s fetch first" % dst
+
+        order = [line[len("push "):].lstrip("+").partition(":")[2] for line in batch]
+        return "".join(results[d] + "\n" for d in order if d in results) + "\n"
+
+    def option(self, name, value):
+        if name in ("verbosity", "progress", "force"):
+            return "ok\n"
+        if name == "cas":
+            ref, _, sha = value.partition(":")
+            self.cas[ref] = sha if len(sha) == 40 else ZERO
+            return "ok\n"
+        return "unsupported\n"
+
+
+def serve(remote):
+    stdin = sys.stdin.buffer
+    out = sys.stdout
+
+    def readline():
+        line = stdin.readline()
+        if not line:
+            return None
+        return line.decode().rstrip("\n")
+
+    while True:
+        line = readline()
+        if line is None or line == "":
+            break
+        if line == "capabilities":
+            out.write("fetch\npush\noption\n\n")
+        elif line.startswith("option "):
+            _, name, value = (line.split(" ", 2) + [""])[:3]
+            out.write(remote.option(name, value))
+        elif line in ("list", "list for-push"):
+            out.write(remote.list_refs())
+        elif line.startswith("fetch ") or line.startswith("push "):
+            kind = line.split(" ", 1)[0]
+            batch = [line]
+            while True:
+                nxt = readline()
+                if nxt is None or nxt == "":
+                    break
+                batch.append(nxt)
+            out.write(remote.fetch(batch) if kind == "fetch" else remote.push(batch))
+        else:
+            die("unknown command %r" % line)
+        out.flush()
+
+
+def seed(remote):
+    remote.refresh()
+    if remote.exists:
+        print("exists")
+        return 0
+    env = dict(remote.cache_env)
+    for var, default in (("GIT_AUTHOR_NAME", "beads"), ("GIT_AUTHOR_EMAIL", "beads@localhost")):
+        env.setdefault(var, default)
+        env.setdefault(var.replace("AUTHOR", "COMMITTER"), env[var])
+    tree = run(["git", "--git-dir", remote.cache, "mktree"], env=env,
+               input_bytes=b"").stdout.decode().strip()
+    commit = run(["git", "--git-dir", remote.cache, "commit-tree", tree, "-m", "init"],
+                 env=env).stdout.decode().strip()
+    remote.cgit("update-ref", "refs/heads/main", commit)
+    if not remote.upload():
+        remote.clear_refs()
+        die("the object was created by someone else meanwhile; run again", 2)
+    print("created")
+    return 0
+
+
+def main(argv):
+    cfg = load_config()
+    if len(argv) == 3 and argv[1] in ("--stat", "--seed"):
+        remote = Remote(argv[2], cfg)
+        if argv[1] == "--seed":
+            return seed(remote)
+        return 0 if remote.head_etag() is not None else 3
+    if len(argv) != 3:
+        die("usage: git-remote-s3bundle <remote> s3bundle://<bucket>/<key>")
+    serve(Remote(argv[2], cfg))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

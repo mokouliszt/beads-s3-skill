@@ -1,0 +1,3 @@
+skills/*/auth/credentials.json
+__pycache__/
+*.pyc
