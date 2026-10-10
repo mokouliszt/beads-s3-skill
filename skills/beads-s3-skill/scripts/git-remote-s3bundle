@@ -102,7 +102,25 @@ def make_client(cfg):
                       response_checksum_validation="when_required", **base)
     except TypeError:
         conf = Config(**base)
-    return boto3.client("s3", config=conf, **kwargs)
+    client = boto3.client("s3", config=conf, **kwargs)
+    client.meta.events.register("before-send.s3", drop_expect_header)
+    return client
+
+
+def drop_expect_header(request, **_):
+    """Send uploads without "Expect: 100-continue".
+
+    botocore adds the header to every upload with a file body, and its
+    handling of the reply needs a reason phrase on the status line. Some
+    services send none: Backblaze B2 answers a conditional PUT with
+    "HTTP/1.1 501 " plus NotImplemented. botocore then drops that line and
+    fails with ConnectionClosedError instead of returning the 501, so the
+    fallback for services without conditional writes never ran. Without the
+    header, the reply goes through the standard HTTP parser, which reads it.
+    A before-send handler that returns a value replaces the response, so
+    this one must return None.
+    """
+    request.headers.pop("Expect", None)
 
 
 def error_info(exc):
