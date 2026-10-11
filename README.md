@@ -26,7 +26,14 @@ Enable object versioning on the bucket so every push is preserved as a snapshot 
 
 1. Create a bucket and an access key scoped to it.
 2. Copy `skills/beads-s3-skill/auth/credentials.example.json` to `credentials.json` in the same directory and fill it in.
-3. Zip the `skills/beads-s3-skill` folder (or take the `.skill` file from Releases and add `credentials.json`), then upload it to your AI app.
+3. Build a package with your settings inside (Python 3, standard library only):
+
+   ```bash
+   python3 .github/scripts/package_skill.py skills/beads-s3-skill \
+     --credentials skills/beads-s3-skill/auth/credentials.json
+   ```
+
+   This writes `dist/beads-s3-skill-private.skill`. Upload it to your AI app. It contains your access key, so do not share it.
 
 | Key | Required | Description |
 | --- | --- | --- |
@@ -78,6 +85,10 @@ You can share a project with a local bd install (for instance, when working with
 4. In the project, run `bd dolt remote add origin git+https://s3bundle.invalid/<bucket>/<prefix><project>.bundle`.
 
 Use the bd version specified in `<prefix>bd/VERSION`. bd cannot open a database whose schema is newer than the binary.
+
+## Releases
+
+Publishing a release on GitHub runs `.github/workflows/release.yml`, which attaches `beads-s3-skill.skill` to it. The package is built from the tagged commit and contains no credentials, so build your own with step 3 of [Setup](#setup). You can also run the workflow from the Actions tab with a tag name such as `v0.1`: an existing tag is built as-is, while a new tag and release are created from the selected branch.
 
 ## License
 

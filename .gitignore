@@ -1,3 +1,7 @@
 skills/*/auth/credentials.json
 __pycache__/
 *.pyc
+
+# Packages built by .github/scripts/package_skill.py. A private one holds your bucket keys.
+dist/
+*.skill

@@ -1,0 +1,3 @@
+# Check out LF line endings everywhere, Windows included: a script with CRLF
+# line endings does not run in the Linux sandboxes this skill targets.
+* text=auto eol=lf

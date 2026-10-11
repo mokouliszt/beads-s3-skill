@@ -26,7 +26,14 @@ beads本体のスキルにセットアップスクリプトを追加した構成
 
 1. バケットを作成し、そのバケットのみに権限を絞ったアクセスキーを用意します。
 2. `skills/beads-s3-skill/auth/credentials.example.json` を同じディレクトリに `credentials.json` としてコピーし、接続設定を入力します。
-3. `skills/beads-s3-skill` フォルダをzip圧縮するか、Releasesの `.skill` ファイルに `credentials.json` を追加して、AIアプリにアップロードします。
+3. 接続設定を含めたパッケージをビルドします（Python 3の標準ライブラリだけで動きます）。
+
+   ```bash
+   python3 .github/scripts/package_skill.py skills/beads-s3-skill \
+     --credentials skills/beads-s3-skill/auth/credentials.json
+   ```
+
+   `dist/beads-s3-skill-private.skill` が作成されるので、AIアプリにアップロードします。アクセスキーが含まれるため、他人と共有しないでください。
 
 | キー | 必須 | 内容 |
 | --- | --- | --- |
@@ -78,6 +85,10 @@ bash scripts/setup.sh --upgrade [version]   # 省略時は最新リリース
 4. プロジェクト内で `bd dolt remote add origin git+https://s3bundle.invalid/<bucket>/<prefix><project>.bundle` を実行します。
 
 ローカルのbdは `<prefix>bd/VERSION` に指定されたバージョンを使用してください。bdは、自身より新しいスキーマのデータベースを開くことができません。
+
+## リリース
+
+GitHubでリリースを公開すると `.github/workflows/release.yml` が実行され、`beads-s3-skill.skill` がそのリリースに添付されます。このパッケージはタグのコミットからビルドされ、認証情報を含まないため、自分用のパッケージは[セットアップ](#セットアップ)の手順3で作成してください。Actionsタブから `v0.1` のようなタグ名を指定して、このワークフローを手動実行することもできます。既存のタグはそのままビルドし、新規タグの場合は実行したブランチ上にタグとリリースを作成します。
 
 ## ライセンス
 

@@ -1,0 +1,67 @@
+name: Release
+
+# Attaches beads-s3-skill.skill, built from the tagged commit, to a release.
+#
+# - Publishing a release on GitHub runs this for that release.
+# - Running it from the Actions tab with a tag name (e.g. v0.1) builds that tag if
+#   it exists. Otherwise the tag is created, with its release, on the branch the run uses.
+#
+# The package never contains credentials; see .github/scripts/package_skill.py.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag to release, e.g. v0.1
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event.release.tag_name || inputs.tag }}
+
+jobs:
+  skill:
+    runs-on: ubuntu-latest
+    env:
+      SKILL: beads-s3-skill
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check out the tag
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          if [[ ! "$TAG" =~ ^v[0-9][0-9A-Za-z._-]*$ ]]; then
+            echo "::error::The tag must look like v0.1 (got '$TAG')."
+            exit 1
+          fi
+          # Keep this run's packager: an older tag may not have it.
+          cp .github/scripts/package_skill.py "$RUNNER_TEMP/"
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null; then
+            git fetch --quiet --depth=1 origin "+refs/tags/$TAG:refs/tags/$TAG"
+            git checkout --quiet --detach "refs/tags/$TAG"
+            echo "Building the existing tag $TAG ($(git rev-parse --short HEAD))."
+          else
+            echo "$TAG does not exist yet; it will be created at $(git rev-parse --short HEAD)."
+          fi
+
+      - name: Build ${{ env.SKILL }}.skill
+        run: |
+          packager="$RUNNER_TEMP/package_skill.py"
+          [ -f "$packager" ] || packager=.github/scripts/package_skill.py
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)" \
+            python3 "$packager" "skills/$SKILL" --out "dist/$SKILL.skill"
+
+      - name: Attach it to the release
+        run: |
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --target "$(git rev-parse HEAD)" --title "$TAG" --generate-notes
+          fi
+          gh release upload "$TAG" "dist/$SKILL.skill" --clobber
