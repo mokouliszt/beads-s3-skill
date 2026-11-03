@@ -353,7 +353,9 @@ class Remote:
             if expected is not None and before.get(dst, ZERO) != expected:
                 results[dst] = "error %s stale info" % dst
                 continue
-            specs.append((force, src, dst))
+            # A lease that held is git's --force-with-lease: bd's Dolt remote
+            # writes parentless commits and relies on it to replace the ref.
+            specs.append((force or expected is not None, src, dst))
 
         changed = []
         if specs:
